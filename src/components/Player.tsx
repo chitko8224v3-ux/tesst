@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useImperativeHandle, forwardRef, useCallback } from 'react';
 import Hls from 'hls.js';
 import { Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, Maximize, Minimize, Film, Sparkles, RefreshCw, AlertCircle } from 'lucide-react';
-import { FloatingReaction, PlayerHandle } from '../types';
+import { FloatingReaction, PlayerHandle, DesiredPlaybackState } from '../types';
 
 declare global {
   interface Window {
@@ -53,11 +53,13 @@ export function parseMediaUrl(url: string): { kind: 'yt'; id: string } | { kind:
 interface PlayerProps {
   url: string;
   isHost: boolean;
+  desiredState: DesiredPlaybackState;
   drift: number;
   reactions: FloatingReaction[];
   onLocalPlay: (time: number) => void;
   onLocalPause: (time: number) => void;
   onLocalSeek: (time: number) => void;
+  onReady?: () => void;
   onResync: () => void;
   onOpenLibrary: () => void;
   theaterMode: boolean;
@@ -68,11 +70,13 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
   {
     url,
     isHost,
+    desiredState,
     drift,
     reactions,
     onLocalPlay,
     onLocalPause,
     onLocalSeek,
+    onReady,
     onResync,
     onOpenLibrary,
     theaterMode,
@@ -100,8 +104,20 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
   const isSeekingRef = useRef(false);
   const lastReportedTimeRef = useRef(0);
   const ytPollRef = useRef<NodeJS.Timeout | null>(null);
+  const isApplyingRemoteRef = useRef(false);
 
-  // Format seconds to mm:ss or hh:mm:ss
+  // Keep latest desiredState in a ref for callbacks
+  const desiredRef = useRef(desiredState);
+  useEffect(() => {
+    desiredRef.current = desiredState;
+  }, [desiredState]);
+
+  const getDesiredCurrentTime = useCallback(() => {
+    const s = desiredRef.current;
+    if (!s) return 0;
+    return s.playing ? Math.max(0, s.time + (Date.now() - s.at) / 1000) : s.time;
+  }, []);
+
   const formatTime = (secs: number) => {
     if (isNaN(secs) || secs < 0) return '0:00';
     const h = Math.floor(secs / 3600);
@@ -123,9 +139,60 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     }
   };
 
+  const executeApplySync = useCallback((playing: boolean, time: number, forceSeek = false) => {
+    isApplyingRemoteRef.current = true;
+    setShowTapToPlay(false);
+
+    if (ytRef.current) {
+      const yt = ytRef.current;
+      const cur = yt.getCurrentTime() || 0;
+      if (forceSeek || Math.abs(cur - time) > 1.2) {
+        try {
+          yt.seekTo(Math.max(0, time), true);
+        } catch {}
+      }
+      if (playing) {
+        try {
+          yt.playVideo();
+        } catch {}
+      } else {
+        try {
+          yt.pauseVideo();
+        } catch {}
+      }
+    } else if (videoRef.current) {
+      const v = videoRef.current;
+      const cur = v.currentTime || 0;
+      if (forceSeek || Math.abs(cur - time) > 1.2) {
+        try {
+          v.currentTime = Math.max(0, time);
+        } catch {}
+      }
+      if (playing) {
+        const p = v.play();
+        if (p?.catch) {
+          p.catch((err) => {
+            if (err?.name === 'NotAllowedError') {
+              setShowTapToPlay(true);
+            }
+          });
+        }
+      } else {
+        try {
+          v.pause();
+        } catch {}
+      }
+    }
+
+    setTimeout(() => {
+      isApplyingRemoteRef.current = false;
+    }, 400);
+  }, []);
+
   // Expose player controls to parent
   useImperativeHandle(ref, () => ({
     play: () => {
+      isApplyingRemoteRef.current = true;
       setShowTapToPlay(false);
       if (ytRef.current) {
         try {
@@ -133,7 +200,7 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
         } catch {}
       } else if (videoRef.current) {
         const p = videoRef.current.play();
-        if (p && p.catch) {
+        if (p?.catch) {
           p.catch((err) => {
             if (err?.name === 'NotAllowedError') {
               setShowTapToPlay(true);
@@ -141,8 +208,12 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
           });
         }
       }
+      setTimeout(() => {
+        isApplyingRemoteRef.current = false;
+      }, 300);
     },
     pause: () => {
+      isApplyingRemoteRef.current = true;
       if (ytRef.current) {
         try {
           ytRef.current.pauseVideo();
@@ -150,8 +221,12 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
       } else if (videoRef.current) {
         videoRef.current.pause();
       }
+      setTimeout(() => {
+        isApplyingRemoteRef.current = false;
+      }, 300);
     },
     seek: (time: number) => {
+      isApplyingRemoteRef.current = true;
       if (ytRef.current) {
         try {
           ytRef.current.seekTo(Math.max(0, time), true);
@@ -161,6 +236,12 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
           videoRef.current.currentTime = Math.max(0, time);
         } catch {}
       }
+      setTimeout(() => {
+        isApplyingRemoteRef.current = false;
+      }, 400);
+    },
+    applySync: (playing: boolean, time: number, forceSeek = false) => {
+      executeApplySync(playing, time, forceSeek);
     },
     time: () => {
       if (ytRef.current) {
@@ -288,14 +369,32 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
               onReady: () => {
                 if (!isMounted) return;
                 ytRef.current = ytPlayer;
-                setDuration(ytPlayer.getDuration() || 0);
+                const d = ytPlayer.getDuration() || 0;
+                setDuration(d);
+
+                // Initial sync upon load
+                const initialTarget = getDesiredCurrentTime();
+                const shouldPlay = desiredRef.current.playing;
+
+                if (initialTarget > 0) {
+                  try {
+                    ytPlayer.seekTo(initialTarget, true);
+                  } catch {}
+                }
+                if (shouldPlay) {
+                  try {
+                    ytPlayer.playVideo();
+                  } catch {}
+                }
+
+                if (onReady) onReady();
 
                 ytPollRef.current = setInterval(() => {
                   try {
                     const t = ytPlayer.getCurrentTime() || 0;
-                    const d = ytPlayer.getDuration() || 0;
+                    const dur = ytPlayer.getDuration() || 0;
                     setCurrentTime(t);
-                    if (d > 0) setDuration(d);
+                    if (dur > 0) setDuration(dur);
                   } catch {}
                 }, 500);
               },
@@ -304,6 +403,10 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
                 const state = e.data;
                 const curT = ytPlayer.getCurrentTime() || 0;
                 setCurrentTime(curT);
+
+                if (isApplyingRemoteRef.current) {
+                  return;
+                }
 
                 if (state === 1) {
                   // PLAYING
@@ -339,8 +442,7 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
           if (isMounted) initYT();
         };
       } else {
-        // Yield to allow React DOM render of slot
-        setTimeout(initYT, 50);
+        setTimeout(initYT, 60);
       }
 
       return () => {
@@ -352,6 +454,37 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
       const video = videoRef.current;
       if (!video) return;
 
+      const handleInitialSync = () => {
+        setDuration(video.duration || 0);
+
+        const initialTarget = getDesiredCurrentTime();
+        const shouldPlay = desiredRef.current.playing;
+
+        isApplyingRemoteRef.current = true;
+        if (initialTarget > 0) {
+          try {
+            video.currentTime = initialTarget;
+          } catch {}
+        }
+        if (shouldPlay) {
+          const p = video.play();
+          if (p?.catch) {
+            p.catch((err) => {
+              if (err?.name === 'NotAllowedError') {
+                setShowTapToPlay(true);
+              }
+            });
+          }
+        }
+        setTimeout(() => {
+          isApplyingRemoteRef.current = false;
+        }, 400);
+
+        if (onReady) onReady();
+      };
+
+      video.addEventListener('loadedmetadata', handleInitialSync, { once: true });
+
       if (media.kind === 'hls') {
         if (Hls.isSupported()) {
           const hls = new Hls({
@@ -360,9 +493,6 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
           });
           hls.loadSource(media.url);
           hls.attachMedia(video);
-          hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            setDuration(video.duration || 0);
-          });
           hls.on(Hls.Events.ERROR, (_, data) => {
             if (data.fatal) {
               setLoadError('HLS stream loading failed. The host server might block cross-origin playback.');
@@ -383,7 +513,7 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     return () => {
       destroyCurrentPlayer();
     };
-  }, [url, destroyCurrentPlayer, onLocalPlay, onLocalPause]);
+  }, [url, destroyCurrentPlayer, getDesiredCurrentTime, onLocalPlay, onLocalPause, onReady]);
 
   // Fullscreen toggle
   const toggleFullscreen = () => {
@@ -409,6 +539,7 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
   const onVideoPlay = () => {
     setIsPlaying(true);
     setShowTapToPlay(false);
+    if (isApplyingRemoteRef.current) return;
     if (videoRef.current) {
       onLocalPlay(videoRef.current.currentTime);
     }
@@ -416,6 +547,7 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
 
   const onVideoPause = () => {
     setIsPlaying(false);
+    if (isApplyingRemoteRef.current) return;
     if (videoRef.current && !videoRef.current.ended) {
       onLocalPause(videoRef.current.currentTime);
     }
@@ -427,14 +559,9 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     setCurrentTime(t);
   };
 
-  const onVideoLoadedMetadata = () => {
-    if (videoRef.current) {
-      setDuration(videoRef.current.duration || 0);
-    }
-  };
-
   const onVideoSeeked = () => {
     if (!videoRef.current) return;
+    if (isApplyingRemoteRef.current) return;
     const t = videoRef.current.currentTime;
     if (Math.abs(t - lastReportedTimeRef.current) > 0.5) {
       lastReportedTimeRef.current = t;
@@ -513,6 +640,18 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     }
   };
 
+  const handleTapToJoin = () => {
+    setShowTapToPlay(false);
+    const target = getDesiredCurrentTime();
+    if (ytRef.current) {
+      if (target > 0) ytRef.current.seekTo(target, true);
+      ytRef.current.playVideo();
+    } else if (videoRef.current) {
+      if (target > 0) videoRef.current.currentTime = target;
+      videoRef.current.play().catch(() => {});
+    }
+  };
+
   return (
     <div
       ref={containerRef}
@@ -537,7 +676,6 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
               onPlay={onVideoPlay}
               onPause={onVideoPause}
               onTimeUpdate={onVideoTimeUpdate}
-              onLoadedMetadata={onVideoLoadedMetadata}
               onSeeked={onVideoSeeked}
               onError={onVideoError}
               onClick={handlePlayPauseToggle}
@@ -592,23 +730,19 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
 
       {/* Autoplay block overlay ("Tap to join playback") */}
       {showTapToPlay && (
-        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm z-30 flex flex-col items-center justify-center p-6 text-center animate-in fade-in duration-200">
+        <div className="absolute inset-0 bg-black/75 backdrop-blur-sm z-30 flex flex-col items-center justify-center p-6 text-center animate-in fade-in duration-200">
           <div className="p-4 rounded-full bg-indigo-500/20 border border-indigo-500/40 mb-3 text-indigo-400 animate-pulse">
             <Play className="w-8 h-8 fill-indigo-400" />
           </div>
           <h4 className="text-lg font-bold text-white mb-1">Click to Sync Audio & Video</h4>
           <p className="text-xs text-slate-300 max-w-xs mb-4">
-            Your browser requires an initial user interaction before enabling audio playback.
+            The room is playing at {formatTime(getDesiredCurrentTime())}. Click below to enable browser audio and join!
           </p>
           <button
-            onClick={() => {
-              setShowTapToPlay(false);
-              if (ytRef.current) ytRef.current.playVideo();
-              else videoRef.current?.play();
-            }}
+            onClick={handleTapToJoin}
             className="px-6 py-2.5 rounded-xl font-bold text-sm bg-gradient-to-r from-indigo-500 to-sky-500 text-white shadow-xl hover:scale-105 active:scale-95 transition-all"
           >
-            ▶ Join Playback Now
+            ▶ Join Playback ({formatTime(getDesiredCurrentTime())})
           </button>
         </div>
       )}

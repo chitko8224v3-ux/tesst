@@ -47,10 +47,17 @@ export interface DemoVideo {
   badge?: string;
 }
 
+export interface DesiredPlaybackState {
+  playing: boolean;
+  time: number;
+  at: number;
+}
+
 export interface PlayerHandle {
   play: () => void;
   pause: () => void;
   seek: (time: number) => void;
+  applySync: (playing: boolean, time: number, forceSeek?: boolean) => void;
   time: () => number;
   duration: () => number;
   playing: () => boolean;

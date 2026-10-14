@@ -9,12 +9,6 @@ import {
   Sparkles,
   RefreshCw,
   Share2,
-  Users,
-  Radio,
-  ExternalLink,
-  Crown,
-  Volume2,
-  VolumeX,
 } from 'lucide-react';
 import { Player } from './components/Player';
 import { Sidebar } from './components/Sidebar';
@@ -27,13 +21,12 @@ import {
   ChatMessageItem,
   FloatingReaction,
   PlayerHandle,
+  DesiredPlaybackState,
 } from './types';
 import {
   playJoinSound,
   playMessageSound,
   playReactionSound,
-  isSoundEnabled,
-  setSoundEnabled,
 } from './utils/sound';
 
 const PREFIX = 'wtgr-';
@@ -66,6 +59,11 @@ export default function App() {
   const [currentVideoTime, setCurrentVideoTime] = useState(0);
   const [theaterMode, setTheaterMode] = useState(false);
   const [drift, setDrift] = useState(0);
+  const [desiredState, setDesiredState] = useState<DesiredPlaybackState>({
+    playing: false,
+    time: 0,
+    at: Date.now(),
+  });
 
   // Networking & Chat
   const [peers, setPeers] = useState<PeerUser[]>([]);
@@ -80,7 +78,22 @@ export default function App() {
   const [isInviteOpen, setIsInviteOpen] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
 
-  // References
+  // References - CRITICAL for avoiding stale closures in WebRTC events
+  const currentUrlRef = useRef(currentUrl);
+  useEffect(() => {
+    currentUrlRef.current = currentUrl;
+  }, [currentUrl]);
+
+  const myNameRef = useRef(myName);
+  useEffect(() => {
+    myNameRef.current = myName;
+  }, [myName]);
+
+  const isHostRef = useRef(isHost);
+  useEffect(() => {
+    isHostRef.current = isHost;
+  }, [isHost]);
+
   const peerRef = useRef<Peer | null>(null);
   const hostConnRef = useRef<DataConnection | null>(null);
   const connsRef = useRef<Map<string, DataConnection>>(new Map());
@@ -90,15 +103,17 @@ export default function App() {
   const chainRef = useRef<Promise<void>>(Promise.resolve());
 
   // Shared desired playback truth: { playing: boolean, time: number, at: number }
-  const desiredRef = useRef({ playing: false, time: 0, at: Date.now() });
+  const desiredRef = useRef<DesiredPlaybackState>({ playing: false, time: 0, at: Date.now() });
 
   const getDesiredTime = () => {
     const { playing, time, at } = desiredRef.current;
-    return playing ? time + (Date.now() - at) / 1000 : time;
+    return playing ? Math.max(0, time + (Date.now() - at) / 1000) : time;
   };
 
   const setDesired = (playing: boolean, time: number) => {
-    desiredRef.current = { playing, time, at: Date.now() };
+    const newState = { playing, time, at: Date.now() };
+    desiredRef.current = newState;
+    setDesiredState(newState);
   };
 
   const showToast = useCallback((msg: string, kind: 'info' | 'err' | 'success' = 'info') => {
@@ -154,27 +169,6 @@ export default function App() {
     namesRef.current.clear();
   }, []);
 
-  // Apply state received from remote peer
-  const applyState = useCallback((s: { playing: boolean; time: number }, seekThreshold = 1.0) => {
-    setDesired(s.playing, s.time);
-    const p = playerRef.current;
-    if (!p) return;
-
-    const cur = p.time();
-    const driftAmt = Math.abs(cur - s.time);
-    setDrift(driftAmt);
-
-    if (driftAmt > seekThreshold) {
-      p.seek(s.time);
-    }
-
-    if (s.playing) {
-      p.play();
-    } else {
-      p.pause();
-    }
-  }, []);
-
   // Add system message
   const addSystemMessage = useCallback((text: string) => {
     const item: ChatMessageItem = {
@@ -209,6 +203,19 @@ export default function App() {
     setTimeout(() => {
       setReactions((prev) => prev.filter((r) => r.id !== id));
     }, 2400);
+  }, []);
+
+  // Apply state received from remote peer
+  const applyState = useCallback((s: { playing: boolean; time: number }, seekThreshold = 1.0) => {
+    setDesired(s.playing, s.time);
+    const p = playerRef.current;
+    if (!p) return;
+
+    const cur = p.time();
+    const driftAmt = Math.abs(cur - s.time);
+    setDrift(driftAmt);
+
+    p.applySync(s.playing, s.time, driftAmt > seekThreshold);
   }, []);
 
   // Remote message dispatcher
@@ -248,8 +255,9 @@ export default function App() {
         }
 
         case 'load': {
-          addSystemMessage(`${m.from || 'Someone'} loaded a new video: ${m.title || 'Video'}`);
+          addSystemMessage(`${m.from || 'Someone'} loaded: ${m.title || 'New video'}`);
           enqueue(async () => {
+            currentUrlRef.current = m.url;
             setCurrentUrl(m.url);
             setUrlInput(m.url);
             setDesired(false, 0);
@@ -259,11 +267,18 @@ export default function App() {
 
         case 'state': {
           enqueue(async () => {
-            if (m.url && m.url !== currentUrl) {
+            // First update desired state
+            setDesired(m.playing, m.time);
+
+            // If URL changed or needs loading:
+            if (m.url && m.url !== currentUrlRef.current) {
+              currentUrlRef.current = m.url;
               setCurrentUrl(m.url);
               setUrlInput(m.url);
+            } else if (playerRef.current) {
+              // Video is already loaded, apply sync directly
+              applyState({ playing: m.playing, time: m.time }, 0);
             }
-            applyState({ playing: m.playing, time: m.time }, 0);
           });
           break;
         }
@@ -286,20 +301,21 @@ export default function App() {
         case 'tick': {
           enqueue(() => {
             const p = playerRef.current;
-            if (!p || isHost) return;
+            if (!p || isHostRef.current) return;
             const curT = p.time();
             const driftDelta = Math.abs(curT - m.time);
             setDrift(driftDelta);
 
-            if (driftDelta > 2.5 || m.playing !== desiredRef.current.playing || (m.playing && !p.playing())) {
-              applyState(m, driftDelta > 2 ? 1.5 : 99);
+            const isPlayingMismatch = m.playing !== desiredRef.current.playing || (m.playing && !p.playing());
+            if (driftDelta > 2.0 || isPlayingMismatch) {
+              applyState(m, driftDelta > 2.0 ? 1.5 : 99);
             }
           });
           break;
         }
       }
     },
-    [addSystemMessage, applyState, currentUrl, enqueue, isHost, triggerReaction]
+    [addSystemMessage, applyState, enqueue, triggerReaction]
   );
 
   // Host: accept guest connection
@@ -318,13 +334,23 @@ export default function App() {
           const guestName = String(m.name || 'Guest').slice(0, 20);
           namesRef.current.set(c.peer, guestName);
 
-          // Reply with current playback state
-          const curTime = playerRef.current ? getDesiredTime() : 0;
+          // Get current playback timestamp
+          let curTime = getDesiredTime();
+          if (playerRef.current) {
+            try {
+              curTime = playerRef.current.time();
+            } catch {}
+          }
+
+          const curUrl = currentUrlRef.current;
+          const isCurrentlyPlaying = desiredRef.current.playing;
+
+          // Send current state to the joining guest
           c.send({
             t: 'state',
-            url: currentUrl,
+            url: curUrl,
             time: curTime,
-            playing: desiredRef.current.playing,
+            playing: isCurrentlyPlaying,
           });
 
           // Announce to everyone
@@ -334,7 +360,7 @@ export default function App() {
 
           // Broadcast updated peer list
           const list: PeerUser[] = [
-            { name: myName, host: true },
+            { name: myNameRef.current, host: true },
             ...Array.from(connsRef.current.keys()).map((id) => ({
               id,
               name: namesRef.current.get(id) || 'Guest',
@@ -347,10 +373,16 @@ export default function App() {
         }
 
         if (m.t === 'sync') {
-          const curTime = playerRef.current ? getDesiredTime() : 0;
+          let curTime = getDesiredTime();
+          if (playerRef.current) {
+            try {
+              curTime = playerRef.current.time();
+            } catch {}
+          }
+
           c.send({
             t: 'state',
-            url: currentUrl,
+            url: currentUrlRef.current,
             time: curTime,
             playing: desiredRef.current.playing,
           });
@@ -372,7 +404,7 @@ export default function App() {
         broadcast({ t: 'sys', text: leftText });
 
         const list: PeerUser[] = [
-          { name: myName, host: true },
+          { name: myNameRef.current, host: true },
           ...Array.from(connsRef.current.keys()).map((id) => ({
             id,
             name: namesRef.current.get(id) || 'Guest',
@@ -387,7 +419,7 @@ export default function App() {
         console.warn('Connection error with peer:', err);
       });
     },
-    [addSystemMessage, broadcast, currentUrl, handleRemoteMessage, myName]
+    [addSystemMessage, broadcast, handleRemoteMessage]
   );
 
   // Host: Create a Room
@@ -415,6 +447,7 @@ export default function App() {
         showToast(`Room ${code} created!`, 'success');
 
         if (initialMediaUrl) {
+          currentUrlRef.current = initialMediaUrl;
           setCurrentUrl(initialMediaUrl);
           setUrlInput(initialMediaUrl);
         }
@@ -425,15 +458,20 @@ export default function App() {
 
         // Periodic host sync heartbeat tick
         tickTimerRef.current = setInterval(() => {
-          if (connsRef.current.size > 0) {
-            const t = playerRef.current ? playerRef.current.time() : 0;
+          if (connsRef.current.size > 0 && currentUrlRef.current) {
+            let t = getDesiredTime();
+            if (playerRef.current) {
+              try {
+                t = playerRef.current.time();
+              } catch {}
+            }
             broadcast({
               t: 'tick',
               time: t,
               playing: desiredRef.current.playing,
             });
           }
-        }, 4000);
+        }, 3000);
       });
 
       peer.on('connection', hostAccept);
@@ -488,6 +526,7 @@ export default function App() {
           addSystemMessage(`Joined room ${cleanCode}`);
           showToast(`Joined room ${cleanCode}!`, 'success');
 
+          // Send hello to host to receive current movie URL and playback timestamp
           conn.send({ t: 'hello', name: userName });
 
           try {
@@ -527,6 +566,7 @@ export default function App() {
     setInRoom(false);
     setIsHost(false);
     setRoomCode('');
+    currentUrlRef.current = '';
     setCurrentUrl('');
     setUrlInput('');
     setPeers([]);
@@ -582,16 +622,25 @@ export default function App() {
 
       addSystemMessage(`You loaded: ${title || clean}`);
       enqueue(() => {
+        currentUrlRef.current = clean;
         setCurrentUrl(clean);
         setUrlInput(clean);
         setDesired(false, 0);
       });
 
-      send({ t: 'load', url: clean, title, from: myName });
+      send({ t: 'load', url: clean, title, from: myNameRef.current });
       showToast('Video loaded for everyone in the room!', 'success');
     },
-    [addSystemMessage, enqueue, myName, send, showToast]
+    [addSystemMessage, enqueue, send, showToast]
   );
+
+  // Player finished loading media metadata
+  const handlePlayerReady = useCallback(() => {
+    if (!isHostRef.current) {
+      // Guest can ping sync to verify alignment with host
+      send({ t: 'sync' });
+    }
+  }, [send]);
 
   // Send Chat message
   const handleSendMessage = useCallback(
@@ -600,26 +649,26 @@ export default function App() {
       const timestamp = Date.now();
       const msgItem: ChatMessageItem = {
         id,
-        from: myName,
+        from: myNameRef.current,
         text,
         mine: true,
         timestamp,
         videoTime: time,
       };
       setMessages((prev) => [...prev, msgItem]);
-      send({ t: 'chat', id, from: myName, text, time, timestamp });
+      send({ t: 'chat', id, from: myNameRef.current, text, time, timestamp });
     },
-    [myName, send]
+    [send]
   );
 
   // Send emoji reaction
   const handleSendReaction = useCallback(
     (emoji: string) => {
       const id = Math.random().toString(36).substring(2, 9);
-      triggerReaction(emoji, myName);
-      send({ t: 'reaction', id, from: myName, emoji });
+      triggerReaction(emoji, myNameRef.current);
+      send({ t: 'reaction', id, from: myNameRef.current, emoji });
     },
-    [myName, send, triggerReaction]
+    [send, triggerReaction]
   );
 
   // Request resync
@@ -640,7 +689,6 @@ export default function App() {
   useEffect(() => {
     const hash = window.location.hash.replace(/^#(room=)?/, '').trim().toUpperCase();
     if (hash && hash.length >= 4) {
-      // Auto populate code
       setRoomCode(hash.slice(0, 5));
     }
   }, []);
@@ -835,11 +883,13 @@ export default function App() {
               ref={playerRef}
               url={currentUrl}
               isHost={isHost}
+              desiredState={desiredState}
               drift={drift}
               reactions={reactions}
               onLocalPlay={handleLocalPlay}
               onLocalPause={handleLocalPause}
               onLocalSeek={handleLocalSeek}
+              onReady={handlePlayerReady}
               onResync={handleResync}
               onOpenLibrary={() => setIsLibraryOpen(true)}
               theaterMode={theaterMode}
