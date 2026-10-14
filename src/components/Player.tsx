@@ -1,7 +1,27 @@
 import React, { useEffect, useRef, useState, useImperativeHandle, forwardRef, useCallback } from 'react';
 import Hls from 'hls.js';
-import { Play, Pause, RotateCcw, RotateCw, Volume2, VolumeX, Maximize, Minimize, Film, Sparkles, RefreshCw, AlertCircle } from 'lucide-react';
-import { FloatingReaction, PlayerHandle, DesiredPlaybackState } from '../types';
+import {
+  Play,
+  Pause,
+  RotateCcw,
+  RotateCw,
+  Volume2,
+  VolumeX,
+  Maximize,
+  Minimize,
+  Film,
+  Sparkles,
+  RefreshCw,
+  AlertCircle,
+  MessageSquare,
+  MessageSquareOff,
+  Send,
+  Smile,
+  X,
+  Clock,
+} from 'lucide-react';
+import { FloatingReaction, PlayerHandle, DesiredPlaybackState, ChatMessageItem, PeerUser } from '../types';
+import { playReactionSound } from '../utils/sound';
 
 declare global {
   interface Window {
@@ -50,12 +70,19 @@ export function parseMediaUrl(url: string): { kind: 'yt'; id: string } | { kind:
   return { kind: 'video', url: clean };
 }
 
+const QUICK_EMOJIS = ['🍿', '❤️', '🔥', '😂', '🤯', '👏', '😭', '🎉'];
+
 interface PlayerProps {
   url: string;
   isHost: boolean;
   desiredState: DesiredPlaybackState;
   drift: number;
   reactions: FloatingReaction[];
+  messages: ChatMessageItem[];
+  peers: PeerUser[];
+  myName: string;
+  onSendMessage: (text: string, time?: number) => void;
+  onSendReaction: (emoji: string) => void;
   onLocalPlay: (time: number) => void;
   onLocalPause: (time: number) => void;
   onLocalSeek: (time: number) => void;
@@ -73,6 +100,11 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     desiredState,
     drift,
     reactions,
+    messages,
+    peers,
+    myName,
+    onSendMessage,
+    onSendReaction,
     onLocalPlay,
     onLocalPause,
     onLocalSeek,
@@ -88,6 +120,7 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
   const videoRef = useRef<HTMLVideoElement>(null);
   const ytRef = useRef<YTPlayerInstance | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
 
   const [kind, setKind] = useState<'video' | 'hls' | 'yt' | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -100,6 +133,11 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
   const [isControlsVisible, setIsControlsVisible] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  // Fullscreen chat overlay state
+  const [showFsChat, setShowFsChat] = useState(true);
+  const [fsChatText, setFsChatText] = useState('');
+  const [isFsTyping, setIsFsTyping] = useState(false);
+
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isSeekingRef = useRef(false);
   const lastReportedTimeRef = useRef(0);
@@ -111,6 +149,13 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
   useEffect(() => {
     desiredRef.current = desiredState;
   }, [desiredState]);
+
+  // Auto scroll in-fullscreen chat when new message arrives
+  useEffect(() => {
+    if (showFsChat && isFullscreen) {
+      chatScrollRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, showFsChat, isFullscreen]);
 
   const getDesiredCurrentTime = useCallback(() => {
     const s = desiredRef.current;
@@ -132,10 +177,10 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
   const handleMouseMove = () => {
     setIsControlsVisible(true);
     if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
-    if (isPlaying) {
+    if (isPlaying && !isFsTyping) {
       controlsTimeoutRef.current = setTimeout(() => {
         setIsControlsVisible(false);
-      }, 2800);
+      }, 3200);
     }
   };
 
@@ -652,6 +697,23 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
     }
   };
 
+  const handleFullscreenChatSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = fsChatText.trim();
+    if (!text) return;
+    onSendMessage(text, Math.floor(currentTime));
+    setFsChatText('');
+  };
+
+  // Color generator for avatar initials
+  const getAvatarColor = (name: string) => {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    const hues = [220, 260, 290, 330, 160, 190, 35];
+    const hue = hues[Math.abs(hash) % hues.length];
+    return `hsl(${hue}, 70%, 45%)`;
+  };
+
   return (
     <div
       ref={containerRef}
@@ -728,6 +790,121 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
         ))}
       </div>
 
+      {/* Fullscreen Chat Messages Overlay (Left corner of video) */}
+      {isFullscreen && showFsChat && (
+        <div className="absolute bottom-20 left-4 w-80 sm:w-96 max-h-[50vh] flex flex-col justify-end z-30 pointer-events-auto animate-in fade-in slide-in-from-bottom-3 duration-200">
+          <div className="bg-[#0e1017]/80 backdrop-blur-md border border-white/15 rounded-2xl p-3 shadow-2xl flex flex-col max-h-[44vh] overflow-hidden">
+            {/* Overlay Header */}
+            <div className="flex items-center justify-between pb-2 mb-2 border-b border-white/10 text-xs">
+              <div className="flex items-center gap-2 text-white font-bold">
+                <MessageSquare className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Room Chat</span>
+                <span className="px-1.5 py-0.5 rounded-full bg-white/10 text-[10px] text-slate-300 font-mono">
+                  {peers.length} online
+                </span>
+              </div>
+              <button
+                onClick={() => setShowFsChat(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors"
+                title="Hide chat overlay (shortcut in controls bar)"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {/* Messages Scroll Area */}
+            <div className="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[90px] max-h-48 text-xs">
+              {messages.length === 0 ? (
+                <div className="text-slate-400 text-[11px] text-center py-4 italic">
+                  No messages yet. Send a message or reaction below!
+                </div>
+              ) : (
+                messages.slice(-25).map((m) => {
+                  if (m.isSystem) {
+                    return (
+                      <div key={m.id} className="text-center my-1">
+                        <span className="px-2 py-0.5 rounded-full bg-white/5 text-[10px] text-slate-400 italic">
+                          {m.text}
+                        </span>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div
+                      key={m.id}
+                      className={`flex flex-col ${m.mine ? 'items-end' : 'items-start'}`}
+                    >
+                      <div className="flex items-center gap-1.5 mb-0.5 text-[10px] text-slate-400">
+                        <span
+                          className="w-1.5 h-1.5 rounded-full"
+                          style={{ backgroundColor: getAvatarColor(m.from) }}
+                        />
+                        <span className={m.mine ? 'text-indigo-300 font-bold' : 'text-slate-300 font-semibold'}>
+                          {m.from}
+                        </span>
+                        {m.videoTime !== undefined && (
+                          <span className="text-[9px] font-mono text-indigo-400 bg-indigo-500/10 px-1 rounded">
+                            {formatTime(m.videoTime)}
+                          </span>
+                        )}
+                      </div>
+                      <div
+                        className={`px-2.5 py-1.5 rounded-xl max-w-[90%] break-words text-[11px] shadow ${
+                          m.mine
+                            ? 'bg-indigo-600 text-white rounded-tr-none'
+                            : 'bg-white/10 text-slate-100 border border-white/10 rounded-tl-none'
+                        }`}
+                      >
+                        {m.text}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+              <div ref={chatScrollRef} />
+            </div>
+
+            {/* Fullscreen Quick Reaction Bar */}
+            <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-1 mt-1">
+              {QUICK_EMOJIS.slice(0, 6).map((emoji) => (
+                <button
+                  key={emoji}
+                  onClick={() => {
+                    playReactionSound();
+                    onSendReaction(emoji);
+                  }}
+                  className="p-1 text-base hover:scale-125 active:scale-95 transition-transform"
+                  title={`React with ${emoji}`}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+
+            {/* Fullscreen In-Player Chat Input */}
+            <form onSubmit={handleFullscreenChatSubmit} className="mt-2 flex gap-1.5">
+              <input
+                type="text"
+                value={fsChatText}
+                onChange={(e) => setFsChatText(e.target.value)}
+                onFocus={() => setIsFsTyping(true)}
+                onBlur={() => setIsFsTyping(false)}
+                placeholder="Type a message..."
+                maxLength={200}
+                className="flex-1 bg-black/60 border border-white/15 focus:border-indigo-400 rounded-xl px-3 py-1.5 text-xs text-white placeholder-slate-400 outline-none"
+              />
+              <button
+                type="submit"
+                disabled={!fsChatText.trim()}
+                className="p-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white shadow disabled:opacity-40"
+              >
+                <Send className="w-3.5 h-3.5" />
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Autoplay block overlay ("Tap to join playback") */}
       {showTapToPlay && (
         <div className="absolute inset-0 bg-black/75 backdrop-blur-sm z-30 flex flex-col items-center justify-center p-6 text-center animate-in fade-in duration-200">
@@ -783,11 +960,11 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
         </div>
       )}
 
-      {/* Custom Video Controls Bar (for Direct video/HLS) */}
+      {/* Custom Video Controls Bar */}
       {url && kind !== 'yt' && (
         <div
           className={`absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/50 to-transparent p-4 z-20 transition-opacity duration-300 ${
-            isControlsVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
+            isControlsVisible || isFsTyping ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
           }`}
         >
           {/* Progress / Seek bar */}
@@ -867,6 +1044,22 @@ export const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
                   <span>Resync</span>
+                </button>
+              )}
+
+              {/* Fullscreen Chat Toggle Button */}
+              {isFullscreen && (
+                <button
+                  onClick={() => setShowFsChat(!showFsChat)}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium flex items-center gap-1.5 transition-colors ${
+                    showFsChat
+                      ? 'bg-indigo-600 text-white'
+                      : 'bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white'
+                  }`}
+                  title={showFsChat ? 'Hide Chat Overlay' : 'Show Chat Overlay'}
+                >
+                  {showFsChat ? <MessageSquare className="w-3.5 h-3.5" /> : <MessageSquareOff className="w-3.5 h-3.5" />}
+                  <span>Chat</span>
                 </button>
               )}
 

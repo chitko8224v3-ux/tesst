@@ -65,3 +65,12 @@ export interface PlayerHandle {
   setMuted: (muted: boolean) => void;
   destroy: () => void;
 }
+
+export interface ActiveRoomInfo {
+  code: string;
+  hostName: string;
+  movieTitle: string;
+  viewerCount: number;
+  lastSeen: number;
+  createdAt: number;
+}

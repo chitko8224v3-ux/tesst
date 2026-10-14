@@ -22,12 +22,23 @@ import {
   FloatingReaction,
   PlayerHandle,
   DesiredPlaybackState,
+  ActiveRoomInfo,
 } from './types';
 import {
   playJoinSound,
   playMessageSound,
   playReactionSound,
 } from './utils/sound';
+import {
+  fetchActiveRooms,
+  registerActiveRoom,
+  removeActiveRoom,
+  getRecentRooms,
+  addRecentRoom,
+  clearRecentRooms,
+  subscribeToRoomBroadcasts,
+  RecentRoom,
+} from './utils/roomRegistry';
 
 const PREFIX = 'wtgr-';
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -77,6 +88,40 @@ export default function App() {
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isInviteOpen, setIsInviteOpen] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
+
+  // Active and Recent Rooms State
+  const [activeRooms, setActiveRooms] = useState<ActiveRoomInfo[]>([]);
+  const [recentRooms, setRecentRooms] = useState<RecentRoom[]>(() => getRecentRooms());
+  const [isLoadingRooms, setIsLoadingRooms] = useState(false);
+  const roomHeartbeatRef = useRef<NodeJS.Timeout | null>(null);
+
+  const loadRooms = useCallback(async () => {
+    setIsLoadingRooms(true);
+    try {
+      const rooms = await fetchActiveRooms();
+      setActiveRooms(rooms);
+    } finally {
+      setIsLoadingRooms(false);
+    }
+  }, []);
+
+  // Poll available rooms when on lobby screen
+  useEffect(() => {
+    if (inRoom) return;
+    loadRooms();
+    setRecentRooms(getRecentRooms());
+
+    const interval = setInterval(loadRooms, 3500);
+    const unsubscribe = subscribeToRoomBroadcasts(() => {
+      loadRooms();
+      setRecentRooms(getRecentRooms());
+    });
+
+    return () => {
+      clearInterval(interval);
+      unsubscribe();
+    };
+  }, [inRoom, loadRooms]);
 
   // References - CRITICAL for avoiding stale closures in WebRTC events
   const currentUrlRef = useRef(currentUrl);
@@ -456,7 +501,23 @@ export default function App() {
           window.history.replaceState(null, '', '#' + code);
         } catch {}
 
-        // Periodic host sync heartbeat tick
+        const movieTitle = initialMediaUrl ? initialMediaUrl.split('/').pop()?.split('?')[0] : 'In Lobby';
+        registerActiveRoom({
+          code,
+          hostName: userName,
+          movieTitle: movieTitle || 'Movie Watch Party',
+          viewerCount: 1,
+        });
+
+        addRecentRoom({
+          code,
+          name: userName,
+          movieTitle,
+          visitedAt: Date.now(),
+        });
+        setRecentRooms(getRecentRooms());
+
+        // Periodic host sync heartbeat tick and room registry update
         tickTimerRef.current = setInterval(() => {
           if (connsRef.current.size > 0 && currentUrlRef.current) {
             let t = getDesiredTime();
@@ -472,6 +533,20 @@ export default function App() {
             });
           }
         }, 3000);
+
+        if (roomHeartbeatRef.current) clearInterval(roomHeartbeatRef.current);
+        roomHeartbeatRef.current = setInterval(() => {
+          if (!isHostRef.current) return;
+          const curMovie = currentUrlRef.current
+            ? currentUrlRef.current.split('/').pop()?.split('?')[0] || 'Watching Movie'
+            : 'In Lobby';
+          registerActiveRoom({
+            code,
+            hostName: myNameRef.current,
+            movieTitle: curMovie,
+            viewerCount: connsRef.current.size + 1,
+          });
+        }, 4000);
       });
 
       peer.on('connection', hostAccept);
@@ -526,6 +601,13 @@ export default function App() {
           addSystemMessage(`Joined room ${cleanCode}`);
           showToast(`Joined room ${cleanCode}!`, 'success');
 
+          addRecentRoom({
+            code: cleanCode,
+            name: 'Watch Party',
+            visitedAt: Date.now(),
+          });
+          setRecentRooms(getRecentRooms());
+
           // Send hello to host to receive current movie URL and playback timestamp
           conn.send({ t: 'hello', name: userName });
 
@@ -562,6 +644,14 @@ export default function App() {
   );
 
   const handleLeaveRoom = () => {
+    if (roomHeartbeatRef.current) {
+      clearInterval(roomHeartbeatRef.current);
+      roomHeartbeatRef.current = null;
+    }
+    if (isHost && roomCode) {
+      removeActiveRoom(roomCode);
+    }
+
     teardownPeer();
     setInRoom(false);
     setIsHost(false);
@@ -724,6 +814,14 @@ export default function App() {
         initialName={myName}
         isConnecting={isConnecting}
         errorMessage={lobbyError}
+        activeRooms={activeRooms}
+        recentRooms={recentRooms}
+        isLoadingRooms={isLoadingRooms}
+        onRefreshRooms={loadRooms}
+        onClearRecentRooms={() => {
+          clearRecentRooms();
+          setRecentRooms([]);
+        }}
         onCreateRoom={handleCreateRoom}
         onJoinRoom={handleJoinRoom}
       />
@@ -886,6 +984,11 @@ export default function App() {
               desiredState={desiredState}
               drift={drift}
               reactions={reactions}
+              messages={messages}
+              peers={peers}
+              myName={myName}
+              onSendMessage={handleSendMessage}
+              onSendReaction={handleSendReaction}
               onLocalPlay={handleLocalPlay}
               onLocalPause={handleLocalPause}
               onLocalSeek={handleLocalSeek}
